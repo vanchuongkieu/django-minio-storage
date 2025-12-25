@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "django-minio-storage"
+version = "0.1.0"
+description = "Django Storage backend for MinIO"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Chuong Kieu Van"}
+]
+
+dependencies = [
+    "django>=3.2",
+    "minio>=7.1.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/vanchuongkieu/django-minio-storage"
