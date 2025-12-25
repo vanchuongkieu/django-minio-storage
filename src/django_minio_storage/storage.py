@@ -1,5 +1,6 @@
 from io import BytesIO
 from tempfile import TemporaryFile
+from urllib.parse import urlparse
 
 from django.core.files.uploadedfile import InMemoryUploadedFile
 
@@ -12,11 +13,30 @@ from minio import Minio
 
 @deconstructible
 class MinioStorage(Storage):
-    bucket_name = None
+    bucket_name = getattr(settings, "MINIO_BUCKET_NAME", None)
     _protocol = "http"
     _base_url = None
 
-    def __init__(self, endpoint=None, access_key=None, secret_key=None, secure=True):
+    def get_endpoint(self, endpoint: str | None) -> str | None:
+        if not endpoint:
+            return None
+
+        endpoint = endpoint.strip()
+
+        if endpoint.startswith(("http://", "https://")):
+            parsed = urlparse(endpoint)
+            return parsed.netloc.rstrip("/")
+
+        return endpoint.rstrip("/")
+
+    def __init__(
+        self,
+        bucket_name=None,
+        endpoint=None,
+        access_key=None,
+        secret_key=None,
+        secure=True,
+    ):
         overrides = locals()
         defaults = {
             "endpoint": getattr(settings, "MINIO_ENDPOINT", None),
@@ -24,8 +44,9 @@ class MinioStorage(Storage):
             "secret_key": getattr(settings, "MINIO_SECRET_KEY", None),
             "secure": getattr(settings, "MINIO_SECURE", False),
         }
-        self.bucket_name = getattr(settings, "MINIO_BUCKET_NAME", None)
+        self.bucket_name = bucket_name or overrides["bucket_name"] or self.bucket_name
         kwargs = {k: overrides[k] or v for k, v in defaults.items()}
+        kwargs["endpoint"] = self.get_endpoint(kwargs["endpoint"])
 
         requires = ["endpoint", "access_key", "secret_key"]
 
