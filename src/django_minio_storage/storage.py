@@ -1,100 +1,156 @@
 from io import BytesIO
-from tempfile import TemporaryFile
+from tempfile import NamedTemporaryFile
+from typing import BinaryIO, Optional
 from urllib.parse import urlparse
 
-from django.core.files.uploadedfile import InMemoryUploadedFile
-
-from django.conf import settings
 from django.core.files.base import File
 from django.core.files.storage import Storage
 from django.utils.deconstruct import deconstructible
 from minio import Minio
+from minio.error import S3Error
 
 
 @deconstructible
 class MinioStorage(Storage):
-    bucket_name = getattr(settings, "MINIO_BUCKET_NAME", None)
-    _protocol = "http"
-    _base_url = None
+    """Django Storage backend for MinIO.
 
-    def get_endpoint(self, endpoint: str | None) -> str | None:
-        if not endpoint:
-            return None
+    Reads configuration from Django settings when not provided explicitly:
+    - STORAGE_MINIO_ENDPOINT
+    - STORAGE_MINIO_ACCESS_KEY
+    - STORAGE_MINIO_SECRET_KEY
+    - STORAGE_MINIO_SECURE
+    - STORAGE_MINIO_BUCKET_NAME
 
-        endpoint = endpoint.strip()
+    # For Django 4.2+
+    STORAGES = {
+        "default": {
+            "BACKEND": "django_minio_storage.MinioStorage",
+        },
+    }
 
-        if endpoint.startswith(("http://", "https://")):
-            parsed = urlparse(endpoint)
-            return parsed.netloc.rstrip("/")
+    # Or with options
+    STORAGES = {
+        "default": {
+            "BACKEND": "django_minio_storage.MinioStorage",
+            "OPTIONS": {
+                "bucket_name": "",
+                "endpoint": "", # s3.example.com
+                "access_key": "",
+                "secret_key": "",
+                "secure": True,  # True or False
+            },
+        },
+    }
 
-        return endpoint.rstrip("/")
+    # For Django versions below 4.2
+    DEFAULT_FILE_STORAGE = "django_minio_storage.MinioStorage"
+    """
 
     def __init__(
         self,
-        bucket_name=None,
-        endpoint=None,
-        access_key=None,
-        secret_key=None,
-        secure=True,
+        bucket_name: Optional[str] = None,
+        endpoint: Optional[str] = None,
+        access_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        secure: Optional[bool] = None,
     ):
-        overrides = locals()
-        defaults = {
-            "endpoint": getattr(settings, "MINIO_ENDPOINT", None),
-            "access_key": getattr(settings, "MINIO_ACCESS_KEY", None),
-            "secret_key": getattr(settings, "MINIO_SECRET_KEY", None),
-            "secure": getattr(settings, "MINIO_SECURE", False),
-        }
-        self.bucket_name = bucket_name or overrides["bucket_name"] or self.bucket_name
-        kwargs = {k: overrides[k] or v for k, v in defaults.items()}
-        kwargs["endpoint"] = self.get_endpoint(kwargs["endpoint"])
+        from django.conf import settings
 
-        requires = ["endpoint", "access_key", "secret_key"]
+        endpoint = endpoint or getattr(settings, "STORAGE_MINIO_ENDPOINT", None)
+        access_key = access_key or getattr(settings, "STORAGE_MINIO_ACCESS_KEY", None)
+        secret_key = secret_key or getattr(settings, "STORAGE_MINIO_SECRET_KEY", None)
+        bucket_name = bucket_name or getattr(settings, "STORAGE_MINIO_BUCKET_NAME", None)
 
-        validates = [kwargs.get(param) is not None for param in requires]
-        validates.append(self.bucket_name is not None)
+        if secure is None:
+            secure = getattr(settings, "STORAGE_MINIO_SECURE", False)
 
-        if not all(validates):
-            raise ValueError(f"Minio requires {', '.join(requires)} parameters.")
+        endpoint = self._normalize_endpoint(endpoint)
 
-        self._protocol = "https" if kwargs["secure"] else "http"
-        self._base_url = f"{self._protocol}://{kwargs['endpoint']}"
-        self.minio = Minio(**kwargs)
+        if not all([endpoint, access_key, secret_key, bucket_name]):
+            raise ValueError("Minio requires endpoint, access_key, secret_key and bucket_name.")
 
-    def _upload_file(self, object_name: str | None, file_data: InMemoryUploadedFile):
-        content_type = getattr(file_data, "content_type", "application/octet-stream")
+        self.bucket_name = bucket_name
+        self._protocol = "https" if secure else "http"
+        self._base_url = f"{self._protocol}://{endpoint}"
+        self.minio = Minio(
+            endpoint=endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            secure=secure,
+        )
+
+    @staticmethod
+    def _normalize_endpoint(endpoint: Optional[str]) -> Optional[str]:
+        if not endpoint:
+            return None
+        endpoint = endpoint.strip()
+        if endpoint.startswith(("http://", "https://")):
+            parsed = urlparse(endpoint)
+            return parsed.netloc.rstrip("/")
+        return endpoint.rstrip("/")
+
+    def _get_file_obj_and_size(self, content) -> tuple[BinaryIO, int]:
+        file_obj = getattr(content, "file", None) or getattr(content, "stream", None) or content
+
+        size = getattr(content, "size", None)
+        if size is None:
+            buf = BytesIO()
+            try:
+                file_obj.seek(0)
+            except Exception:
+                pass
+            buf.write(file_obj.read())
+            buf.seek(0)
+            file_obj = buf
+            size = buf.getbuffer().nbytes
+
+        return file_obj, int(size)
+
+    def save(self, name: str, content, max_length=None):
+        file_obj, size = self._get_file_obj_and_size(content)
+        content_type = getattr(content, "content_type", "application/octet-stream")
+
+        try:
+            file_obj.seek(0)
+        except Exception:
+            pass
+
         self.minio.put_object(
             bucket_name=self.bucket_name,
-            object_name=object_name,
-            data=file_data.file,
-            length=file_data.size,
+            object_name=name,
+            data=file_obj,
+            length=size,
             content_type=content_type,
         )
-        return object_name
 
-    def save(self, object_name, object_content, max_length=None):
-        return self._upload_file(object_name, object_content)
+        return name
 
-    def delete(self, object_name):
-        self.minio.remove_object(object_name=object_name, bucket_name=self.bucket_name)
-
-    def exists(self, object_name):
-        return False
-
-    def _temporary_storage(self, contents):
-        conent_file = TemporaryFile(contents, "r+")
-        return conent_file
-
-    def open(self, object_name, mode="rb"):
-        response = self.minio.get_object(self.bucket_name, object_name)
+    def open(self, name: str, mode: str = "rb"):
+        response = self.minio.get_object(self.bucket_name, name)
         try:
-            object_bytes = response.read()
-            output = BytesIO()
-            output.write(object_bytes)
-            output.seek(0)
-            return File(output, object_name)
+            data = response.read()
+            buf = BytesIO(data)
+            buf.seek(0)
+            return File(buf, name)
         finally:
             response.close()
             response.release_conn()
 
-    def url(self, object_name):
-        return "{}/{}/{}".format(self._base_url, self.bucket_name, object_name)
+    def exists(self, name: str) -> bool:
+        try:
+            self.minio.stat_object(self.bucket_name, name)
+            return True
+        except S3Error:
+            return False
+
+    def delete(self, name: str) -> None:
+        try:
+            self.minio.remove_object(bucket_name=self.bucket_name, object_name=name)
+        except S3Error:
+            pass
+
+    def url(self, name: str) -> str:
+        return f"{self._base_url}/{self.bucket_name}/{name}"
+
+    def _temporary_storage(self, contents=None):
+        return NamedTemporaryFile(mode="w+b", delete=True)
